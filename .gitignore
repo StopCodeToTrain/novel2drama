@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+.venv*/
+venv*/
+
+# Models (too large for git)
+models/
+*.gguf
+*.pt
+*.pth
+*.bin
+
+# Cache
+cache/
+.cache/
+
+# Output
+output/
+*.wav
+*.mp3
+*.flac
+
+# Settings (contains local config)
+settings.json
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+Thumbs.db
+.DS_Store
+
+# CosyVoice
+CosyVoice/
+.cosyvoice/
+
+# Logs
+*.log

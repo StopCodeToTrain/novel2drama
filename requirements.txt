@@ -1,0 +1,43 @@
+# Novel to Radio Drama - 依赖
+
+# 深度学习框架
+torch>=2.1.0
+torchaudio>=2.1.0
+transformers>=4.40.0
+
+# LLM 推理（文本分析）
+# llama-cpp-python 需用 Vulkan 预编译轮子安装:
+# pip install llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/vulkan
+llama-cpp-python>=0.3.0
+openai>=1.0.0  # OpenAI 兼容 API 调用
+
+# TTS - Edge-TTS（在线，立即可用）
+edge-tts>=7.0.0
+
+# TTS - CosyVoice2（可选，需 Python 3.10）
+# 需单独从 https://github.com/FunAudioLLM/CosyVoice 安装
+# git clone --recursive https://github.com/FunAudioLLM/CosyVoice.git
+# cd CosyVoice && pip install -e .
+
+# 音频处理
+pydub>=0.25.1
+pedalboard>=0.9.0
+soundfile>=0.12.0
+imageio-ffmpeg>=0.4.0  # 自带 ffmpeg 二进制，用于 mp3->wav 转换
+numpy>=1.24.0
+
+# 音效生成 - Stable Audio Open（Phase 2，可选）
+# stable-audio-tools 依赖旧版 pandas，与 Python 3.14 不兼容
+# 需要时单独安装: pip install stable-audio-tools
+# stable-audio-tools>=0.0.16
+
+# 中文 NLP 辅助
+# spacy>=3.7.0
+# HanLP>=2.1.0
+
+# 工具
+tqdm>=4.66.0
+pyyaml>=6.0
+
+# GUI
+PyQt6>=6.6.0
