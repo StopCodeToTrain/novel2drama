@@ -60,6 +60,31 @@ class NovelToDramaPipeline:
         """请求取消处理"""
         self._cancelled = True
 
+    def cleanup(self):
+        """释放所有资源（模型连接、大对象引用等）"""
+        import gc
+
+        # 释放 LLM 客户端（含 LM Studio SDK 模型连接）
+        if self.llm:
+            self.llm.close()
+
+        # 释放 TTS 后端
+        if self.tts is not None:
+            if hasattr(self.tts, 'close'):
+                try:
+                    self.tts.close()
+                except Exception:
+                    pass
+            self.tts = None
+
+        # 清空大对象引用
+        self.script_generator = None
+        self.voice_assigner = None
+        self.mixer = None
+
+        # 强制垃圾回收
+        gc.collect()
+
     @property
     def is_cancelled(self) -> bool:
         return self._cancelled

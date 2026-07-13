@@ -238,6 +238,25 @@ class LLMClient:
         raw = self.chat(system_prompt, user_message, temperature)
         return self._extract_json(raw)
 
+    def close(self):
+        """释放 LLM 资源（LM Studio 模型、网络连接等）"""
+        if self._lms_model is not None:
+            try:
+                self._lms_model.unload()
+            except Exception:
+                pass
+            self._lms_model = None
+
+        if self._lms_client is not None:
+            try:
+                self._lms_client.close()
+            except Exception:
+                pass
+            self._lms_client = None
+
+        if self._local_llm is not None:
+            self._local_llm = None
+
     @staticmethod
     def _extract_json(text: str) -> dict:
         """从 LLM 响应中提取 JSON（自动去除 <think> 标签和 markdown 代码块）"""

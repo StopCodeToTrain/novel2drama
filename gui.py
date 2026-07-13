@@ -374,6 +374,14 @@ class PipelineWorker(QThread):
 
         except Exception as e:
             self.error.emit(str(e))
+        finally:
+            # 释放 pipeline 资源（LM Studio 模型连接、大对象等）
+            if self._pipeline:
+                try:
+                    self._pipeline.cleanup()
+                except Exception:
+                    pass
+                self._pipeline = None
 
 
 class OllamaCheckWorker(QThread):
@@ -1712,7 +1720,10 @@ class MainWindow(QMainWindow):
 
     def _on_worker_finished(self):
         """工作线程结束"""
+        import gc
         self._set_buttons_running(False)
+        # 强制垃圾回收，释放 worker 线程中残留的大对象
+        gc.collect()
         if self._final_output:
             self.statusBar().showMessage(f"完成: {self._final_output}")
         else:
