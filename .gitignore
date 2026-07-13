@@ -21,6 +21,9 @@ models/
 cache/
 .cache/
 
+# Input data
+data/
+
 # Output
 output/
 *.wav
