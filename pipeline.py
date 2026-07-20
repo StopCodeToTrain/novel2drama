@@ -61,10 +61,10 @@ class NovelToDramaPipeline:
         self._cancelled = True
 
     def cleanup(self):
-        """释放所有资源（模型连接、大对象引用等）"""
+        """释放所有资源（CUDA 模型、大对象引用等）"""
         import gc
 
-        # 释放 LLM 客户端（含 LM Studio SDK 模型连接）
+        # 释放 LLM（卸载 CUDA 模型、释放 GPU 显存）
         if self.llm:
             self.llm.close()
 

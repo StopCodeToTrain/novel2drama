@@ -8,7 +8,7 @@
   4. 实时显示生成进度与日志
   5. 剧本树形浏览（章节 > 场景 > 台词行）
   6. 逐句音频预览（QMediaPlayer）
-  7. 设置对话框（LLM 后端选择 / Ollama / API / 本地）
+  7. 设置对话框（LLM 后端选择：本地 CUDA / API）
   8. TTS 语音测试对话框
 """
 
@@ -38,8 +38,8 @@ sys.path.insert(0, str(Path(__file__).parent))
 from pipeline import NovelToDramaPipeline
 from config import (
     OUTPUT_DIR, TTSConfig, load_settings, save_settings,
-    get_llm_config, DEFAULT_LLM_SETTINGS, RECOMMENDED_OLLAMA_MODELS,
-    OLLAMA_DOWNLOAD_URL, MODELS_DIR,
+    get_llm_config, DEFAULT_LLM_SETTINGS, RECOMMENDED_CUDA_MODELS,
+    MODELS_DIR, discover_gguf_models, detect_cuda_available,
 )
 
 
@@ -315,7 +315,7 @@ class PipelineWorker(QThread):
 
     def __init__(self, mode: str, input_path: str = "", script_path: str = "",
                  output_path: str = "", use_cache: bool = True,
-                 llm_backend: str = "ollama", narrator_voice: str = "narrator_male"):
+                 llm_backend: str = "local", narrator_voice: str = "narrator_male"):
         """
         Args:
             mode: "generate" | "analyze" | "synthesize"
@@ -384,83 +384,6 @@ class PipelineWorker(QThread):
                 self._pipeline = None
 
 
-class OllamaCheckWorker(QThread):
-    """检查 Ollama 安装状态和已安装模型的线程。"""
-
-    ollama_found = pyqtSignal(bool, list)  # (found, model_list)
-
-    def run(self):
-        """检查 ollama 命令是否存在并获取已安装模型列表"""
-        try:
-            ollama_path = shutil.which("ollama")
-            if not ollama_path:
-                self.ollama_found.emit(False, [])
-                return
-
-            result = subprocess.run(
-                ["ollama", "list"],
-                capture_output=True,
-                text=True,
-                timeout=15,
-                encoding="utf-8",
-                errors="replace",
-                creationflags=_subprocess_flags(),
-            )
-
-            models = []
-            if result.returncode == 0 and result.stdout:
-                lines = result.stdout.strip().split("\n")
-                # 跳过表头行
-                for line in lines[1:]:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    parts = line.split()
-                    if parts:
-                        models.append(parts[0])
-
-            self.ollama_found.emit(True, models)
-        except Exception:
-            self.ollama_found.emit(False, [])
-
-
-class OllamaPullWorker(QThread):
-    """拉取 Ollama 模型的线程。"""
-
-    output = pyqtSignal(str)            # stdout/stderr 输出行
-    pull_finished = pyqtSignal(bool)    # 拉取是否成功
-
-    def __init__(self, model_name: str):
-        super().__init__()
-        self.model_name = model_name
-
-    def run(self):
-        """执行 ollama pull <model_name>"""
-        try:
-            process = subprocess.Popen(
-                ["ollama", "pull", self.model_name],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                creationflags=_subprocess_flags(),
-            )
-
-            if process.stdout:
-                for line in process.stdout:
-                    self.output.emit(line.rstrip())
-
-            process.wait()
-            self.pull_finished.emit(process.returncode == 0)
-        except FileNotFoundError:
-            self.output.emit("错误: 未找到 ollama 命令，请先安装 Ollama")
-            self.pull_finished.emit(False)
-        except Exception as e:
-            self.output.emit(f"错误: {e}")
-            self.pull_finished.emit(False)
-
-
 class TtsTestWorker(QThread):
     """TTS 测试合成工作线程。"""
 
@@ -518,22 +441,17 @@ class TtsTestWorker(QThread):
 # ═══════════════════════════════════════════════════════════════
 
 class SettingsDialog(QDialog):
-    """LLM 设置对话框 -- 配置后端、Ollama / API / 本地参数"""
+    """LLM 设置对话框 — 配置本地 CUDA / API 后端"""
 
-    # 后端选项 -> settings 中的值
-    _BACKEND_MAP = {0: "lmstudio", 1: "api", 2: "ollama", 3: "local"}
-    _BACKEND_REVERSE = {"lmstudio": 0, "api": 1, "ollama": 2, "local": 3}
+    _BACKEND_MAP = {0: "local", 1: "api"}
+    _BACKEND_REVERSE = {"local": 0, "api": 1}
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("设置")
-        self.setMinimumSize(620, 520)
-        self._check_worker: Optional[OllamaCheckWorker] = None
-        self._pull_worker: Optional[OllamaPullWorker] = None
+        self.setMinimumSize(580, 460)
         self._build_ui()
         self._load_settings()
-        # 打开时检查 Ollama 安装状态
-        self._check_ollama()
 
     # ── UI 构建 ──
 
@@ -546,124 +464,114 @@ class SettingsDialog(QDialog):
         backend_layout.addWidget(QLabel("LLM 后端:"))
         self.cmb_backend = QComboBox()
         self.cmb_backend.addItems([
-            "LM Studio (本地推荐)",
-            "API (云端/LM Studio HTTP)",
-            "Ollama (本地)",
-            "llama-cpp (本地GGUF)",
+            "本地 CUDA (llama-cpp, 推荐)",
+            "API (云服务 / 外部接口)",
         ])
         self.cmb_backend.currentIndexChanged.connect(self._on_backend_changed)
         backend_layout.addWidget(self.cmb_backend, 1)
         layout.addLayout(backend_layout)
 
+        # CUDA 状态
+        self.lbl_cuda_status = QLabel()
+        self._update_cuda_status()
+        layout.addWidget(self.lbl_cuda_status)
+
         # ── 标签页 ──
         self.tabs = QTabWidget()
 
-        # ── Ollama 标签页 ──
-        ollama_widget = QWidget()
-        ollama_layout = QVBoxLayout(ollama_widget)
-        ollama_layout.setSpacing(8)
-
-        # Ollama 安装状态
-        self.lbl_ollama_status = QLabel("正在检查 Ollama 安装状态...")
-        ollama_layout.addWidget(self.lbl_ollama_status)
-
-        # 下载按钮（未安装时显示）
-        self.btn_download_ollama = QPushButton("下载 Ollama (打开浏览器)")
-        self.btn_download_ollama.clicked.connect(self._on_download_ollama)
-        self.btn_download_ollama.setVisible(False)
-        ollama_layout.addWidget(self.btn_download_ollama)
-
-        # Base URL
-        url_layout = QHBoxLayout()
-        url_layout.addWidget(QLabel("Base URL:"))
-        self.le_ollama_url = QLineEdit("http://localhost:11434/v1")
-        url_layout.addWidget(self.le_ollama_url, 1)
-        ollama_layout.addLayout(url_layout)
-
-        # 模型选择
-        model_layout = QHBoxLayout()
-        model_layout.addWidget(QLabel("模型:"))
-        self.cmb_ollama_model = QComboBox()
-        self.cmb_ollama_model.setEditable(True)
-        for m in RECOMMENDED_OLLAMA_MODELS:
-            label = f"{m['name']} - {m['description']}"
-            self.cmb_ollama_model.addItem(label, m["name"])
-        model_layout.addWidget(self.cmb_ollama_model, 1)
-        ollama_layout.addLayout(model_layout)
-
-        # 拉取 / 测试按钮
-        btn_layout = QHBoxLayout()
-        self.btn_pull_model = QPushButton("拉取模型")
-        self.btn_pull_model.clicked.connect(self._on_pull_model)
-        self.btn_test_ollama = QPushButton("测试连接")
-        self.btn_test_ollama.clicked.connect(self._on_test_ollama)
-        btn_layout.addWidget(self.btn_pull_model)
-        btn_layout.addWidget(self.btn_test_ollama)
-        btn_layout.addStretch()
-        ollama_layout.addLayout(btn_layout)
-
-        # 拉取输出区域
-        self.txt_pull_output = QTextEdit()
-        self.txt_pull_output.setReadOnly(True)
-        self.txt_pull_output.setMaximumHeight(160)
-        self.txt_pull_output.setPlaceholderText("模型拉取 / 连接测试的输出将显示在这里...")
-        ollama_layout.addWidget(self.txt_pull_output)
-
-        ollama_layout.addStretch()
-        self.tabs.addTab(ollama_widget, "Ollama")
-
-        # ── API 标签页 ──
-        api_widget = QWidget()
-        api_layout = QFormLayout(api_widget)
-        self.le_api_url = QLineEdit("https://api.openai.com/v1")
-        self.le_api_key = QLineEdit()
-        self.le_api_key.setEchoMode(QLineEdit.EchoMode.Password)
-        self.le_api_key.setPlaceholderText("sk-...")
-        self.le_api_model = QLineEdit("gpt-4o-mini")
-        api_layout.addRow("Base URL:", self.le_api_url)
-        api_layout.addRow("API Key:", self.le_api_key)
-        api_layout.addRow("模型名:", self.le_api_model)
-        self.tabs.addTab(api_widget, "API (云端)")
-
-        # ── 本地标签页 ──
+        # ────── 本地 CUDA 标签页 ──────
         local_widget = QWidget()
         local_layout = QVBoxLayout(local_widget)
         local_layout.setSpacing(8)
 
-        # 模型文件路径
+        # 模型路径（自动发现 + 可编辑）
         path_layout = QHBoxLayout()
-        path_layout.addWidget(QLabel("模型路径:"))
-        self.le_local_model_path = QLineEdit()
-        self.le_local_model_path.setPlaceholderText("选择 GGUF 模型文件")
+        path_layout.addWidget(QLabel("模型:"))
+        self.cmb_model_path = QComboBox()
+        self.cmb_model_path.setEditable(True)
+        self.cmb_model_path.setMinimumWidth(350)
+        self.cmb_model_path.setToolTip("自动扫描 models/ 目录下的 .gguf 文件")
         self.btn_browse_model = QPushButton("...")
         self.btn_browse_model.setFixedWidth(40)
         self.btn_browse_model.clicked.connect(self._on_browse_model)
-        path_layout.addWidget(self.le_local_model_path, 1)
+        path_layout.addWidget(self.cmb_model_path, 1)
         path_layout.addWidget(self.btn_browse_model)
         local_layout.addLayout(path_layout)
 
-        # 上下文长度
-        ctx_layout = QHBoxLayout()
-        ctx_layout.addWidget(QLabel("上下文长度:"))
+        # 上下文长度 / GPU 层数
+        row1 = QHBoxLayout()
+        row1.addWidget(QLabel("上下文:"))
         self.spin_ctx = QSpinBox()
         self.spin_ctx.setRange(1024, 131072)
-        self.spin_ctx.setValue(8192)
+        self.spin_ctx.setValue(16384)
         self.spin_ctx.setSingleStep(1024)
-        ctx_layout.addWidget(self.spin_ctx)
-        ctx_layout.addStretch()
-        local_layout.addLayout(ctx_layout)
+        row1.addWidget(self.spin_ctx)
 
-        # 安装说明
+        row1.addWidget(QLabel("GPU 层:"))
+        self.spin_gpu_layers = QSpinBox()
+        self.spin_gpu_layers.setRange(-1, 999)
+        self.spin_gpu_layers.setValue(-1)
+        self.spin_gpu_layers.setSpecialValueText("自动")
+        self.spin_gpu_layers.setToolTip("-1=自动检测，0=纯CPU，999=全部GPU")
+        row1.addWidget(self.spin_gpu_layers)
+        row1.addStretch()
+        local_layout.addLayout(row1)
+
+        # 批大小 / Flash Attention
+        row2 = QHBoxLayout()
+        row2.addWidget(QLabel("批大小:"))
+        self.spin_batch = QSpinBox()
+        self.spin_batch.setRange(64, 4096)
+        self.spin_batch.setValue(512)
+        self.spin_batch.setSingleStep(128)
+        row2.addWidget(self.spin_batch)
+
+        self.chk_flash_attn = QCheckBox("Flash Attention")
+        self.chk_flash_attn.setToolTip("需要 CUDA + 编译时启用")
+        row2.addWidget(self.chk_flash_attn)
+        row2.addStretch()
+        local_layout.addLayout(row2)
+
+        # 推荐模型
+        rec_label = QLabel("推荐模型（下载到 models/ 目录）:")
+        rec_label.setStyleSheet("font-weight: bold; margin-top: 4px;")
+        local_layout.addWidget(rec_label)
+
+        for m in RECOMMENDED_CUDA_MODELS:
+            prefix = "★ " if m["recommended"] else "  "
+            info = QLabel(
+                f"{prefix}{m['name']} | ~{m['size_gb']}GB | "
+                f"显存≥{m['vram_min_gb']}GB | {m['description']}"
+            )
+            info.setStyleSheet("color: #a6adc8; font-size: 11px; padding: 1px 0;")
+            info.setWordWrap(True)
+            local_layout.addWidget(info)
+
+        # 安装提示
         note = QLabel(
-            "注意: 需要先安装 llama-cpp-python\n"
-            "pip install llama-cpp-python --extra-index-url "
-            "https://abetlen.github.io/llama-cpp-python/whl/vulkan"
+            "CUDA 安装命令:\n"
+            "pip install llama-cpp-python "
+            "--extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu122"
         )
-        note.setStyleSheet("color: #f9e2af; padding: 8px;")
+        note.setStyleSheet("color: #f9e2af; padding: 6px; font-size: 11px;")
         note.setWordWrap(True)
         local_layout.addWidget(note)
         local_layout.addStretch()
-        self.tabs.addTab(local_widget, "llama-cpp (本地GGUF)")
+        self.tabs.addTab(local_widget, "本地 CUDA")
+
+        # ────── API 标签页 ──────
+        api_widget = QWidget()
+        api_layout = QFormLayout(api_widget)
+        self.le_api_url = QLineEdit("http://localhost:1234/v1")
+        self.le_api_key = QLineEdit()
+        self.le_api_key.setEchoMode(QLineEdit.EchoMode.Password)
+        self.le_api_key.setPlaceholderText("留空则无需认证")
+        self.le_api_model = QLineEdit()
+        self.le_api_model.setPlaceholderText("例如: qwen/qwen3-4b-2507 或 gpt-4o-mini")
+        api_layout.addRow("Base URL:", self.le_api_url)
+        api_layout.addRow("API Key:", self.le_api_key)
+        api_layout.addRow("模型名:", self.le_api_model)
+        self.tabs.addTab(api_widget, "API")
 
         layout.addWidget(self.tabs)
 
@@ -676,32 +584,47 @@ class SettingsDialog(QDialog):
         btn_save_layout.addWidget(self.btn_save)
         layout.addLayout(btn_save_layout)
 
+    def _update_cuda_status(self):
+        """更新 CUDA 状态标签"""
+        if detect_cuda_available():
+            self.lbl_cuda_status.setText("✓ CUDA GPU 加速可用")
+            self.lbl_cuda_status.setStyleSheet("color: #a6e3a1; font-weight: bold;")
+        else:
+            self.lbl_cuda_status.setText("✗ CUDA 不可用，将使用 CPU 推理")
+            self.lbl_cuda_status.setStyleSheet("color: #f9e2af;")
+
     # ── 加载 / 保存 ──
 
     def _load_settings(self):
         """加载当前设置到界面"""
         settings = get_llm_config()
-        backend = settings.get("llm_backend", "ollama")
+
+        backend = settings.get("llm_backend", "local")
         self.cmb_backend.setCurrentIndex(self._BACKEND_REVERSE.get(backend, 0))
 
-        self.le_ollama_url.setText(
-            settings.get("ollama_base_url", "http://localhost:11434/v1")
-        )
-        ollama_model = settings.get("ollama_model", "qwen3:4b")
-        idx = self.cmb_ollama_model.findData(ollama_model)
-        if idx >= 0:
-            self.cmb_ollama_model.setCurrentIndex(idx)
-        else:
-            self.cmb_ollama_model.setEditText(ollama_model)
+        # 自动发现模型列表
+        self.cmb_model_path.clear()
+        models = discover_gguf_models()
+        current_model = settings.get("local_model_path", "")
+        found_idx = -1
+        for i, m in enumerate(models):
+            name = os.path.basename(m)
+            self.cmb_model_path.addItem(f"{name}  [{os.path.getsize(m)/1e9:.1f}GB]", m)
+            if m == current_model:
+                found_idx = i
+        if found_idx >= 0:
+            self.cmb_model_path.setCurrentIndex(found_idx)
+        elif current_model:
+            self.cmb_model_path.setEditText(current_model)
 
-        self.le_api_url.setText(
-            settings.get("llm_api_base_url", "https://api.openai.com/v1")
-        )
-        self.le_api_key.setText(settings.get("llm_api_key", ""))
-        self.le_api_model.setText(settings.get("llm_api_model", "gpt-4o-mini"))
+        self.spin_ctx.setValue(settings.get("local_n_ctx", 16384))
+        self.spin_gpu_layers.setValue(settings.get("local_n_gpu_layers", -1))
+        self.spin_batch.setValue(settings.get("local_n_batch", 512))
+        self.chk_flash_attn.setChecked(settings.get("local_flash_attn", True))
 
-        self.le_local_model_path.setText(settings.get("local_model_path", ""))
-        self.spin_ctx.setValue(settings.get("local_n_ctx", 8192))
+        self.le_api_url.setText(settings.get("api_base_url", "http://localhost:1234/v1"))
+        self.le_api_key.setText(settings.get("api_key", ""))
+        self.le_api_model.setText(settings.get("api_model", ""))
 
         self._on_backend_changed(self.cmb_backend.currentIndex())
 
@@ -709,19 +632,20 @@ class SettingsDialog(QDialog):
         """保存设置并关闭对话框"""
         settings = load_settings()
 
-        backend = self._BACKEND_MAP.get(self.cmb_backend.currentIndex(), "ollama")
+        backend = self._BACKEND_MAP.get(self.cmb_backend.currentIndex(), "local")
         settings["llm_backend"] = backend
 
-        settings["ollama_base_url"] = self.le_ollama_url.text().strip()
-        ollama_model = self.cmb_ollama_model.currentData() or self.cmb_ollama_model.currentText()
-        settings["ollama_model"] = ollama_model.split()[0] if ollama_model else "qwen3:4b"
-
-        settings["llm_api_base_url"] = self.le_api_url.text().strip()
-        settings["llm_api_key"] = self.le_api_key.text().strip()
-        settings["llm_api_model"] = self.le_api_model.text().strip()
-
-        settings["local_model_path"] = self.le_local_model_path.text().strip()
+        settings["local_model_path"] = (
+            self.cmb_model_path.currentData() or self.cmb_model_path.currentText()
+        )
         settings["local_n_ctx"] = self.spin_ctx.value()
+        settings["local_n_gpu_layers"] = self.spin_gpu_layers.value()
+        settings["local_n_batch"] = self.spin_batch.value()
+        settings["local_flash_attn"] = self.chk_flash_attn.isChecked()
+
+        settings["api_base_url"] = self.le_api_url.text().strip()
+        settings["api_key"] = self.le_api_key.text().strip()
+        settings["api_model"] = self.le_api_model.text().strip()
 
         save_settings(settings)
         self.accept()
@@ -733,98 +657,6 @@ class SettingsDialog(QDialog):
         if 0 <= idx < self.tabs.count():
             self.tabs.setCurrentIndex(idx)
 
-    # ── Ollama 相关 ──
-
-    def _check_ollama(self):
-        """检查 Ollama 安装状态"""
-        self._check_worker = OllamaCheckWorker()
-        self._check_worker.ollama_found.connect(self._on_ollama_checked)
-        self._check_worker.start()
-
-    def _on_ollama_checked(self, found: bool, models: list):
-        """Ollama 检查结果回调"""
-        if found:
-            self.lbl_ollama_status.setText(
-                f"✓ Ollama 已安装（已安装 {len(models)} 个模型）"
-            )
-            self.lbl_ollama_status.setStyleSheet("color: #a6e3a1; font-weight: bold;")
-            self.btn_download_ollama.setVisible(False)
-
-            # 将已安装的模型添加到下拉框
-            if models:
-                for m in models:
-                    if self.cmb_ollama_model.findData(m) < 0:
-                        self.cmb_ollama_model.addItem(f"{m} (已安装)", m)
-        else:
-            self.lbl_ollama_status.setText("✗ Ollama 未安装")
-            self.lbl_ollama_status.setStyleSheet("color: #f38ba8; font-weight: bold;")
-            self.btn_download_ollama.setVisible(True)
-
-    def _on_download_ollama(self):
-        """打开 Ollama 下载页面"""
-        QDesktopServices.openUrl(QUrl(OLLAMA_DOWNLOAD_URL))
-
-    def _on_pull_model(self):
-        """拉取选中的 Ollama 模型"""
-        model_name = self.cmb_ollama_model.currentData() or self.cmb_ollama_model.currentText()
-        model_name = model_name.split()[0] if model_name else ""
-        if not model_name:
-            QMessageBox.warning(self, "提示", "请选择或输入模型名称")
-            return
-
-        self.txt_pull_output.clear()
-        self.btn_pull_model.setEnabled(False)
-        self.txt_pull_output.append(f"开始拉取模型: {model_name}\n")
-
-        self._pull_worker = OllamaPullWorker(model_name)
-        self._pull_worker.output.connect(self._on_pull_output)
-        self._pull_worker.pull_finished.connect(self._on_pull_finished)
-        self._pull_worker.start()
-
-    def _on_pull_output(self, text: str):
-        """拉取输出回调"""
-        self.txt_pull_output.append(text)
-
-    def _on_pull_finished(self, success: bool):
-        """拉取完成回调"""
-        self.btn_pull_model.setEnabled(True)
-        if success:
-            self.txt_pull_output.append("\n✓ 模型拉取成功！")
-        else:
-            self.txt_pull_output.append("\n✗ 模型拉取失败")
-        # 重新检查已安装模型列表
-        self._check_ollama()
-
-    def _on_test_ollama(self):
-        """测试 Ollama 连接"""
-        model_name = self.cmb_ollama_model.currentData() or self.cmb_ollama_model.currentText()
-        model_name = model_name.split()[0] if model_name else ""
-        base_url = self.le_ollama_url.text().strip()
-
-        if not model_name:
-            QMessageBox.warning(self, "提示", "请选择或输入模型名称")
-            return
-
-        self.btn_test_ollama.setEnabled(False)
-        self.txt_pull_output.append(f"\n正在测试连接 {model_name} @ {base_url} ...")
-
-        try:
-            from openai import OpenAI
-            client = OpenAI(base_url=base_url, api_key="ollama")
-            response = client.chat.completions.create(
-                model=model_name,
-                messages=[{"role": "user", "content": "你好"}],
-                max_tokens=50,
-            )
-            reply = response.choices[0].message.content
-            self.txt_pull_output.append(f"✓ 连接成功！回复: {reply}")
-            QMessageBox.information(self, "成功", f"连接成功！\n模型回复: {reply}")
-        except Exception as e:
-            self.txt_pull_output.append(f"✗ 连接失败: {e}")
-            QMessageBox.critical(self, "失败", f"连接失败:\n{e}")
-        finally:
-            self.btn_test_ollama.setEnabled(True)
-
     # ── 本地模型浏览 ──
 
     def _on_browse_model(self):
@@ -834,14 +666,16 @@ class SettingsDialog(QDialog):
             "GGUF 模型 (*.gguf);;所有文件 (*)",
         )
         if path:
-            self.le_local_model_path.setText(path)
+            idx = self.cmb_model_path.findData(path)
+            if idx < 0:
+                name = os.path.basename(path)
+                self.cmb_model_path.insertItem(0, f"{name} (自定义)", path)
+                idx = 0
+            self.cmb_model_path.setCurrentIndex(idx)
 
     # ── 关闭事件 ──
 
     def closeEvent(self, event):
-        """关闭时清理线程"""
-        if self._pull_worker and self._pull_worker.isRunning():
-            self._pull_worker.wait(3000)
         event.accept()
 
 
@@ -1267,7 +1101,7 @@ class MainWindow(QMainWindow):
         # LLM 后端（显示当前设置，可通过设置对话框修改）
         config_layout.addWidget(QLabel("LLM 后端:"), 0, 0)
         self.cmb_llm = QComboBox()
-        self.cmb_llm.addItems(["LM Studio (本地推荐)", "API (云端/LM Studio HTTP)", "Ollama (本地)", "llama-cpp (本地GGUF)"])
+        self.cmb_llm.addItems(["本地 CUDA (llama-cpp, 推荐)", "API (云服务 / 外部接口)"])
         self.cmb_llm.currentIndexChanged.connect(self._on_llm_backend_changed)
         config_layout.addWidget(self.cmb_llm, 0, 1)
 
@@ -1459,22 +1293,20 @@ class MainWindow(QMainWindow):
     def _update_llm_display(self):
         """从 settings.json 读取并更新 LLM 后端显示和模型名标签"""
         settings = get_llm_config()
-        backend = settings.get("llm_backend", "ollama")
+        backend = settings.get("llm_backend", "local")
 
         # 更新下拉框（不触发信号）
-        backend_map = {"ollama": 0, "api": 1, "local": 2}
+        backend_map = {"local": 0, "api": 1}
         self.cmb_llm.blockSignals(True)
         self.cmb_llm.setCurrentIndex(backend_map.get(backend, 0))
         self.cmb_llm.blockSignals(False)
 
         # 更新模型名标签
-        backend_labels = {"ollama": "Ollama", "api": "API", "local": "llama-cpp"}
+        backend_labels = {"local": "本地 CUDA", "api": "API"}
         backend_label = backend_labels.get(backend, backend)
 
-        if backend == "ollama":
-            model = settings.get("ollama_model", "qwen3:4b")
-        elif backend == "api":
-            model = settings.get("llm_api_model", "gpt-4o-mini")
+        if backend == "api":
+            model = settings.get("api_model", "未配置")
         else:
             model = Path(settings.get("local_model_path", "")).name or "未配置"
 
@@ -1499,8 +1331,8 @@ class MainWindow(QMainWindow):
 
     def _on_llm_backend_changed(self, idx: int):
         """主窗口 LLM 后端下拉框变化 -- 保存到设置"""
-        backend_map = {0: "ollama", 1: "api", 2: "local"}
-        backend = backend_map.get(idx, "ollama")
+        backend_map = {0: "local", 1: "api"}
+        backend = backend_map.get(idx, "local")
 
         settings = load_settings()
         settings["llm_backend"] = backend
@@ -1565,7 +1397,7 @@ class MainWindow(QMainWindow):
 
     def _get_llm_backend(self) -> str:
         """从 settings.json 获取当前 LLM 后端（而非从下拉框获取）"""
-        return get_llm_config().get("llm_backend", "ollama")
+        return get_llm_config().get("llm_backend", "local")
 
     def _get_narrator_voice(self) -> str:
         return "narrator_male" if self.cmb_narrator.currentIndex() == 0 else "narrator_female"

@@ -1,8 +1,9 @@
-"""全局配置"""
+"""全局配置 — 基于 CUDA/NVIDIA 显卡生态"""
 
 import os
 import json
 from pathlib import Path
+from typing import List, Optional
 
 # 项目根目录
 PROJECT_ROOT = Path(__file__).parent
@@ -50,55 +51,148 @@ def set_setting(key: str, value) -> None:
     save_settings(settings)
 
 
+# ============ CUDA 环境检测 ============
+
+def detect_cuda_available() -> bool:
+    """检测 CUDA 是否可用（通过 llama-cpp-python 内置检测）"""
+    try:
+        from llama_cpp import llama_cpp
+        return llama_cpp.llama_supports_gpu_offload()
+    except Exception:
+        pass
+    # 备用检测：检查 PyTorch CUDA
+    try:
+        import torch
+        if torch.cuda.is_available():
+            return True
+    except Exception:
+        pass
+    return False
+
+
+# ============ GGUF 模型发现 ============
+
+def discover_gguf_models() -> List[str]:
+    """扫描 models/ 目录，返回所有 .gguf 文件路径列表"""
+    if not MODELS_DIR.exists():
+        return []
+    models = sorted(
+        [str(p) for p in MODELS_DIR.glob("*.gguf")],
+        key=lambda x: os.path.getsize(x),
+    )
+    return models
+
+def get_default_model_path() -> str:
+    """自动选择最佳本地模型（优先小模型 Qwen3-4B）"""
+    models = discover_gguf_models()
+    if not models:
+        return ""
+    # 优先选 Qwen3-4B（体积小、速度快、中文好）
+    for m in models:
+        name = os.path.basename(m).lower()
+        if "qwen3" in name and "4b" in name:
+            return m
+    # 其次选 Qwen2.5-7B
+    for m in models:
+        name = os.path.basename(m).lower()
+        if "qwen" in name and "7b" in name:
+            return m
+    # 兜底：最小的文件
+    return models[0]
+
+
 # ============ LLM 配置（文本分析）============
 
-# LLM 后端类型: "lmstudio" / "api" / "ollama" / "local"
-#   lmstudio: LM Studio 原生 SDK (WebSocket, 最稳定)
-#   api:      OpenAI 兼容 API (直接 HTTP, 适合云端 API)
-#   ollama:   本地 Ollama 服务
-#   local:    本地 llama-cpp-python (GGUF 模型)
+# LLM 后端类型: "local" / "api"
+#   local:  llama-cpp-python + CUDA 本地推理（推荐）
+#   api:    OpenAI 兼容 API（云端或外部服务）
 
 DEFAULT_LLM_SETTINGS = {
-    "llm_backend": "lmstudio",          # 默认用 LM Studio SDK
+    "llm_backend": "local",
 
-    # API 模式配置（支持 LM Studio / OpenAI / DeepSeek 等）
-    "llm_api_base_url": "http://localhost:1234/v1",  # LM Studio 默认地址
-    "llm_api_key": "lm-studio",                      # LM Studio 不需要真实 key
-    "llm_api_model": "qwen/qwen3-4b-2507",           # LM Studio 中加载的模型名
+    # ── 本地 CUDA 模式 ──
+    "local_model_path": "",           # 空 = 自动发现 models/*.gguf
+    "local_n_ctx": 16384,             # 上下文长度（Qwen3-4B 支持 40960）
+    "local_n_gpu_layers": -1,         # -1 = 自动（有 CUDA 全部上 GPU，无 CUDA 用 CPU）
+    "local_n_batch": 512,             # 推理批大小
+    "local_flash_attn": True,         # Flash Attention（需要 CUDA + 编译时启用）
 
-    # Ollama 模式配置
-    "ollama_base_url": "http://localhost:11434/v1",
-    "ollama_model": "qwen3:4b",
+    # ── API 模式 ──
+    "api_base_url": "http://localhost:1234/v1",
+    "api_key": "not-needed",
+    "api_model": "",
 
-    # 本地 llama-cpp 模式配置
-    "local_model_path": str(MODELS_DIR / "Qwen3-4B-Q5_K_M.gguf"),
-    "local_n_ctx": 8192,
-    "local_n_gpu_layers": 0,            # AMD 用 CPU（Vulkan 轮子已装但 AMD 支持有限）
-
-    # 通用参数
+    # ── 通用参数 ──
     "llm_temperature": 0.3,
     "llm_max_tokens": 4096,
 
-    # 剧本生成参数
-    "max_chapters": 20,                 # 最多处理章节数（0=全部，每章一次 LLM 调用）
+    # ── 剧本生成控制 ──
+    "max_chapters": 20,               # 最多处理章节数（0=全部）
 }
 
 def get_llm_config() -> dict:
-    """获取 LLM 配置（合并默认值和用户设置）"""
+    """获取 LLM 配置（合并默认值和用户设置，自动发现模型路径）"""
     settings = load_settings()
     config = DEFAULT_LLM_SETTINGS.copy()
     config.update({k: v for k, v in settings.items() if k in DEFAULT_LLM_SETTINGS})
+
+    # 自动发现模型路径
+    if not config.get("local_model_path"):
+        config["local_model_path"] = get_default_model_path()
+
     return config
+
+
+# ============ CUDA 推荐模型 ============
+
+RECOMMENDED_CUDA_MODELS = [
+    {
+        "name": "Qwen3-4B-Instruct (Q5_K_M)",
+        "gguf_file": "Qwen3-4B-Q5_K_M.gguf",
+        "size_gb": 2.8,
+        "vram_min_gb": 4,
+        "huggingface_url": "https://huggingface.co/unsloth/Qwen3-4B-GGUF",
+        "description": "通义千问3 4B，中文优秀，适合 4-6GB 显存（推荐）",
+        "recommended": True,
+    },
+    {
+        "name": "Qwen3-4B-Instruct (Q4_K_M)",
+        "gguf_file": "Qwen3-4B-Q4_K_M.gguf",
+        "size_gb": 2.5,
+        "vram_min_gb": 3,
+        "huggingface_url": "https://huggingface.co/unsloth/Qwen3-4B-GGUF",
+        "description": "通义千问3 4B，轻量量化，适合 3-4GB 显存",
+        "recommended": False,
+    },
+    {
+        "name": "Qwen2.5-7B-Instruct (Q4_K_M)",
+        "gguf_file": "qwen2.5-7b-instruct-q4_k_m.gguf",
+        "size_gb": 4.7,
+        "vram_min_gb": 6,
+        "huggingface_url": "https://huggingface.co/bartowski/Qwen2.5-7B-Instruct-GGUF",
+        "description": "通义千问2.5 7B，质量更高，适合 6-8GB 显存",
+        "recommended": False,
+    },
+    {
+        "name": "Qwen3-8B-Instruct (Q4_K_M)",
+        "gguf_file": "Qwen3-8B-Q4_K_M.gguf",
+        "size_gb": 5.2,
+        "vram_min_gb": 8,
+        "huggingface_url": "https://huggingface.co/unsloth/Qwen3-8B-GGUF",
+        "description": "通义千问3 8B，质量最佳，需要 8GB+ 显存",
+        "recommended": False,
+    },
+]
 
 
 # ============ TTS 配置 ============
 
 DEFAULT_TTS_SETTINGS = {
-    "tts_backend": "edge-tts",           # "edge-tts"（在线，立即可用）或 "cosyvoice"（需安装）
+    "tts_backend": "edge-tts",           # "edge-tts"（在线）或 "cosyvoice"（本地 GPU）
 
     # CosyVoice2 配置
     "cosyvoice_model_dir": str(MODELS_DIR / "CosyVoice2-0.5B"),
-    "cosyvoice_api_url": "http://127.0.0.1:50000",  # CosyVoice2 API 模式地址
+    "cosyvoice_api_url": "http://127.0.0.1:50000",
 
     # Edge-TTS 配置
     "edge_tts_default_voice": "zh-CN-YunyangNeural",
@@ -114,19 +208,15 @@ class TTSConfig:
     """TTS 引擎配置（向后兼容）"""
     engine = "edge-tts"
 
-    # CosyVoice2 模型路径
     cosyvoice_model_dir = str(MODELS_DIR / "CosyVoice2-0.5B")
     cosyvoice_api_url = "http://127.0.0.1:50000"
 
-    # 采样率
     sample_rate = 24000
 
-    # 语音合成参数
     speed = 1.0
     sentence_pause_ms = 300
     scene_pause_ms = 1000
 
-    # 旁白音色参考音频
     narrator_reference_audio = None
 
 
@@ -162,41 +252,3 @@ class MixerConfig:
     export_format = "wav"
     export_sample_rate = 24000
     export_bitrate = "192k"
-
-
-# ============ Ollama 模型推荐 ============
-
-# 适合中文小说分析的 Ollama 模型列表
-RECOMMENDED_OLLAMA_MODELS = [
-    {
-        "name": "qwen3:4b",
-        "size_gb": 2.5,
-        "description": "通义千问3 4B，中文优秀，CPU 即可流畅运行（推荐）",
-        "ram_gb": 6,
-        "recommended": True,
-    },
-    {
-        "name": "qwen2.5:7b",
-        "size_gb": 4.7,
-        "description": "通义千问2.5 7B，质量更高，需 8GB+ 内存",
-        "ram_gb": 8,
-        "recommended": False,
-    },
-    {
-        "name": "qwen3:8b",
-        "size_gb": 5.2,
-        "description": "通义千问3 8B，质量最佳，需 10GB+ 内存，速度较慢",
-        "ram_gb": 10,
-        "recommended": False,
-    },
-    {
-        "name": "llama3.1:8b",
-        "size_gb": 4.9,
-        "description": "Llama 3.1 8B，英文优秀，中文一般",
-        "ram_gb": 8,
-        "recommended": False,
-    },
-]
-
-# Ollama 下载地址
-OLLAMA_DOWNLOAD_URL = "https://ollama.com/download/OllamaSetup.exe"
