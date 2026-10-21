@@ -165,4 +165,4 @@ novel2drama/
 
 ## License
 
-MIT License
+[MIT License](LICENSE) — Copyright (c) 2026 StopCodeToTrain and contributors.
